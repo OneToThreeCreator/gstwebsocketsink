@@ -9,6 +9,8 @@
 #include <stdbool.h>
 #include <list>
 #include <memory>
+#include <queue>
+#include <condition_variable>
 #include "gst/gstelement.h"
 #include "gst/gstinfo.h"
 #include "gst/gsttask.h"
@@ -66,6 +68,13 @@ struct WSContext
     server ws_endpoint;
     std::mutex stop_mutex;
     bool should_stop;
+
+    // Non-blocking send queue: render() pushes here, sender thread drains
+    std::queue<std::vector<uint8_t>> send_queue;
+    std::mutex send_mutex;
+    std::condition_variable send_cv;
+    std::thread sender_thread;
+    bool sender_running;
 };
 
 typedef struct _GstWebSocketSink
@@ -128,6 +137,10 @@ static void ws_service_thread(GstWebSocketSink *sink)
         sink->ws_context->ws_endpoint.set_reuse_addr(true);
         sink->ws_context->ws_endpoint.listen(boost::asio::ip::tcp::endpoint(boost::asio::ip::address::from_string(sink->host), sink->port));
         sink->ws_context->ws_endpoint.start_accept();
+
+        // Start non-blocking sender thread
+        sink->ws_context->sender_running = true;
+        sink->ws_context->sender_thread = std::thread(ws_sender_thread, sink);
     }
     catch (websocketpp::exception const &e)
     {
@@ -204,32 +217,64 @@ static bool ws_initialise(std::shared_ptr<WSContext> ws_context, GstWebSocketSin
 
 static GstFlowReturn ws_send_data(GstWebSocketSink *sink, const uint8_t *data, size_t length)
 {
-    try
+    // Non-blocking: copy data to queue, sender thread handles actual WebSocket send
     {
-        std::lock_guard<std::mutex> lock(sink->ws_context->connections_mutex);
-        for (auto &hdl : sink->ws_context->connections)
+        std::lock_guard<std::mutex> lock(sink->ws_context->send_mutex);
+        // Drop oldest frames if queue is too full (prevent memory leak with slow clients)
+        while (sink->ws_context->send_queue.size() > 3)
+        {
+            sink->ws_context->send_queue.pop();
+        }
+        std::vector<uint8_t> frame(data, data + length);
+        sink->ws_context->send_queue.push(std::move(frame));
+    }
+    sink->ws_context->send_cv.notify_one();
+    return GST_FLOW_OK;
+}
+
+static void ws_sender_thread(GstWebSocketSink *sink)
+{
+    auto ctx = sink->ws_context;
+    while (ctx->sender_running)
+    {
+        std::vector<uint8_t> frame;
+        {
+            std::unique_lock<std::mutex> lock(ctx->send_mutex);
+            ctx->send_cv.wait(lock, [&] { return !ctx->send_queue.empty() || !ctx->sender_running; });
+            if (!ctx->sender_running && ctx->send_queue.empty()) break;
+            if (ctx->send_queue.empty()) continue;
+            frame = std::move(ctx->send_queue.front());
+            ctx->send_queue.pop();
+        }
+        // Send to all connected clients (blocking, but in dedicated thread)
+        std::lock_guard<std::mutex> lock(ctx->connections_mutex);
+        for (auto &hdl : ctx->connections)
         {
             try
             {
-                sink->ws_context->ws_endpoint.send(hdl, data, length, websocketpp::frame::opcode::binary);
+                ctx->ws_endpoint.send(hdl, frame.data(), frame.size(), websocketpp::frame::opcode::binary);
             }
             catch (websocketpp::exception const &e)
             {
-                GST_ERROR("Websocket send error: %s", e.what());
+                // Ignore send errors (client may have disconnected)
             }
         }
     }
-    catch (websocketpp::exception const &e)
-    {
-        GST_ERROR("Websocket send loop error: %s", e.what());
-    }
-    return GST_FLOW_OK;
 }
 
 static void ws_stop_server(std::shared_ptr<WSContext> ctx)
 {
     try
     {
+        // Stop sender thread first
+        if (ctx->sender_running)
+        {
+            ctx->sender_running = false;
+            ctx->send_cv.notify_one();
+            if (ctx->sender_thread.joinable())
+                ctx->sender_thread.join();
+        }
+
         std::lock_guard<std::mutex> lock(ctx->stop_mutex);
         if (!ctx->should_stop)
         {
@@ -424,6 +469,7 @@ static void gst_websocket_sink_init(GstWebSocketSink *sink)
             sink->ws_context = std::make_shared<WSContext>();
         }
         sink->ws_context->should_stop = false;
+        sink->ws_context->sender_running = false;
     }
     catch (websocketpp::exception const &e)
     {

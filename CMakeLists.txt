@@ -68,6 +68,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_link_libraries(${PROJECT_NAME}
     ${Boost_LIBRARIES}
     ${GSTREAMER_LIBRARIES}
+    pthread
 )
 
 target_compile_options(${PROJECT_NAME} PRIVATE

@@ -248,9 +248,14 @@ static void ws_sender_thread(GstWebSocketSink *sink)
             frame = std::move(ctx->send_queue.front());
             ctx->send_queue.pop();
         }
-        // Send to all connected clients (blocking, but in dedicated thread)
-        std::lock_guard<std::mutex> lock(ctx->connections_mutex);
-        for (auto &hdl : ctx->connections)
+        // Copy connections list under lock, then send WITHOUT holding the lock.
+        // This prevents slow clients from blocking connection management.
+        std::list<connection_hdl> clients;
+        {
+            std::lock_guard<std::mutex> lock(ctx->connections_mutex);
+            clients = ctx->connections;
+        }
+        for (auto &hdl : clients)
         {
             try
             {

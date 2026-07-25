@@ -111,6 +111,8 @@ G_DEFINE_TYPE(GstWebSocketSink, gst_websocket_sink, GST_TYPE_BASE_SINK);
  * PRIVATE FUNCTIONS: WEBSOCKET THREAD
  ******************************************************************************/
 
+static void ws_sender_thread(GstWebSocketSink *sink);
+
 static void ws_service_thread(GstWebSocketSink *sink)
 {
     if (!sink)
